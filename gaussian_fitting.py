@@ -33,16 +33,15 @@ import emcee
 
 
 # Physical / model constants
-OIII_RATIO = 2.98   # [OIII] 5007 / 4959  (fixed by atomic physics)
-NII_RATIO = 2.94   # [NII]  6583 / 6548
+OIII_RATIO = 2.98   # [OIII] 5007 / 4959
+NII_RATIO = 2.94   # [NII] 6583 / 6548
  
 # Minimum S/N for a doublet to be included as a free component
 SNR_THRESHOLD_NII = 2.5
 SNR_THRESHOLD_SII = 2.5
  
-# A doublet is "resolvable" if the line separation exceeds this multiple of
-# the instrumental sigma at that wavelength.
-RESOLVABILITY_FACTOR = 1.0   # set to ~0.5–1.5 depending on how strict you want to be
+# A doublet is "resolvable" if the line separation exceeds this multiple of the instrumental sigma at that wavelength.
+RESOLVABILITY_FACTOR = 1.0   # set to ~0.5-1.5 depending on how strict you want to be
 
 
 def load_instrument_lsf(disp_file: str) -> interp1d:

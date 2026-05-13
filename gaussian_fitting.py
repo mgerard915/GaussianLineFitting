@@ -33,16 +33,26 @@ import emcee
 
 
 # Physical / model constants
+<<<<<<< HEAD
 OIII_RATIO = 2.98   # [OIII] 5007 / 4959  (fixed by atomic physics)
 NII_RATIO = 2.94   # [NII]  6583 / 6548
+=======
+OIII_RATIO = 2.98   # [OIII] 5007 / 4959
+NII_RATIO = 2.94   # [NII] 6583 / 6548
+>>>>>>> 68031545a6fd441ee06278cf95eeeff5366b04d6
  
 # Minimum S/N for a doublet to be included as a free component
 SNR_THRESHOLD_NII = 2.5
 SNR_THRESHOLD_SII = 2.5
  
+<<<<<<< HEAD
 # A doublet is "resolvable" if the line separation exceeds this multiple of
 # the instrumental sigma at that wavelength.
 RESOLVABILITY_FACTOR = 1.0   # set to ~0.5–1.5 depending on how strict you want to be
+=======
+# A doublet is "resolvable" if the line separation exceeds this multiple of the instrumental sigma at that wavelength.
+RESOLVABILITY_FACTOR = 1.0   # set to ~0.5-1.5 depending on how strict you want to be
+>>>>>>> 68031545a6fd441ee06278cf95eeeff5366b04d6
 
 
 def load_instrument_lsf(disp_file: str) -> interp1d:
@@ -391,8 +401,11 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
         guess_R_nii = 0.0
     if not fit_sii:
         guess_R_sii = 0.0
+<<<<<<< HEAD
 
     spec_max = np.nanmax(spec_window)
+=======
+>>>>>>> 68031545a6fd441ee06278cf95eeeff5366b04d6
  
     # initial parameter vector and bounds for curve_fit
     p0 = [
@@ -410,9 +423,15 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
         -m_bound, -b_range,
     ]
     high_bounds = [
+<<<<<<< HEAD
         max(2 * guess_A_hb, spec_max),
         max(2 * guess_A_oiii, spec_max),
         max(2 * guess_A_ha, spec_max), ha_center + delta_mu,
+=======
+        max(2 * guess_A_hb, 1e-5),
+        max(2 * guess_A_oiii, 1e-5),
+        max(2 * guess_A_ha, 1e-5), ha_center + delta_mu,
+>>>>>>> 68031545a6fd441ee06278cf95eeeff5366b04d6
         R_nii_hi, R_sii_hi,
         sigma_int_hi,
         m_bound, b_range,
@@ -564,8 +583,15 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
     ])
     pos += np.random.normal(0, 1e-10, pos.shape)   # break exact degeneracies
  
+<<<<<<< HEAD
     amp_max = max(float(np.nanmax(sigma_clip(flux, sigma=3, maxiters=5).compressed())),
               float(np.nanmax(flux)), 1e-6)
+=======
+    amp_max = max(
+        float(np.nanmax(sigma_clip(flux, sigma=3, maxiters=5).compressed())),
+        1e-6,
+    )
+>>>>>>> 68031545a6fd441ee06278cf95eeeff5366b04d6
  
     # Run MCMC
     sampler = emcee.EnsembleSampler(
@@ -648,4 +674,8 @@ def posterior_summary(df):
         out[col] = med
         out[col + '_err'] = lerr
         out[col + '_snr'] = med / lerr if lerr > 0 else np.nan
+<<<<<<< HEAD
     return out
+=======
+    return out
+>>>>>>> 68031545a6fd441ee06278cf95eeeff5366b04d6

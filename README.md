@@ -1,0 +1,2 @@
+Gaussian emission-line fitting for JWST NIRSpec PRISM spectra using MCMC. Fits Hβ, [OIII] 4959/5007, Hα, [NII] 6548/6583, and [SII] 6716/6731 simultaneously with a linear continuum. [NII] and [SII] are only included as free components if they are significantly detected above the noise and resolvable given the instrumental line spread function.
+Designed for measuring Balmer decrements (Hα/Hβ) and emission-line fluxes for star-forming galaxies.

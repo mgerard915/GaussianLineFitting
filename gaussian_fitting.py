@@ -226,9 +226,9 @@ def log_prior(theta, ha_center, amp_max, sigma_int_max, delta_mu,
     if not np.all(np.isfinite(theta)):
         return -np.inf
 
-    if not (0 < A_hb < 2 * amp_max): return -np.inf
-    if not (0 < A_oiii < 3 * amp_max): return -np.inf
-    if not (0 < A_ha < 3 * amp_max): return -np.inf
+    if not (0 < A_hb < 5 * amp_max): return -np.inf
+    if not (0 < A_oiii < 5 * amp_max): return -np.inf
+    if not (0 < A_ha < 5 * amp_max): return -np.inf
     if not (0 <= R_nii <= 3): return -np.inf
     if not (0 <= R_sii <= 2): return -np.inf
  
@@ -379,7 +379,7 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
     guess_R_nii = 0.2
     guess_R_sii = np.clip(sii_amp / max(guess_A_ha, 1e-6), 0.0, 2.0)
  
-    delta_mu = 2 * sigma_inst_at_ha
+    delta_mu = 5 * sigma_inst_at_ha
     guess_mu_ha = ha_center
  
     # Bounds depend on fit_nii / fit_sii flags 

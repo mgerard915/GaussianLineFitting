@@ -219,16 +219,16 @@ def log_likelihood(theta, x, y, yerr, R_interp, fit_nii, fit_sii):
     return lnL if np.isfinite(lnL) else -np.inf
 
 
-def log_prior(theta, ha_center, amp_max, sigma_int_max, delta_mu,
+def log_prior(theta, ha_center, amp_max_dict, sigma_int_max, delta_mu,
               m_bound, b_range, sigma_inst_at_ha):
     A_hb, A_oiii, A_ha, mu_ha, R_nii, R_sii, sigma_int, m, b = theta
  
     if not np.all(np.isfinite(theta)):
         return -np.inf
 
-    if not (0 < A_hb < 5 * amp_max): return -np.inf
-    if not (0 < A_oiii < 5 * amp_max): return -np.inf
-    if not (0 < A_ha < 5 * amp_max): return -np.inf
+    if not (0 < A_hb < amp_max_dict['hb']): return -np.inf
+    if not (0 < A_oiii < amp_max_dict['oiii']): return -np.inf
+    if not (0 < A_ha < amp_max_dict['ha']): return -np.inf
     if not (0 <= R_nii <= 3): return -np.inf
     if not (0 <= R_sii <= 2): return -np.inf
  
@@ -243,9 +243,9 @@ def log_prior(theta, ha_center, amp_max, sigma_int_max, delta_mu,
     return 0.0
 
 
-def log_probability(theta, x, y, yerr, ha_center, amp_max, sigma_int_max, delta_mu,
+def log_probability(theta, x, y, yerr, ha_center, amp_max_dict, sigma_int_max, delta_mu,
                     m_bound, b_range, sigma_inst_at_ha, R_interp, fit_nii, fit_sii):
-    lp = log_prior(theta, ha_center, amp_max, sigma_int_max, delta_mu,
+    lp = log_prior(theta, ha_center, amp_max_dict, sigma_int_max, delta_mu,
                    m_bound, b_range, sigma_inst_at_ha)
 
     if not np.isfinite(lp):
@@ -379,7 +379,7 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
     guess_R_nii = 0.2
     guess_R_sii = np.clip(sii_amp / max(guess_A_ha, 1e-6), 0.0, 2.0)
  
-    delta_mu = 5 * sigma_inst_at_ha
+    delta_mu = 3 * sigma_inst_at_ha
     guess_mu_ha = ha_center
  
     # Bounds depend on fit_nii / fit_sii flags 
@@ -410,9 +410,9 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
         -m_bound, -b_range,
     ]
     high_bounds = [
-        max(2 * guess_A_hb, spec_max),
-        max(2 * guess_A_oiii, spec_max),
-        max(2 * guess_A_ha, spec_max), ha_center + delta_mu,
+        max(2 * guess_A_hb, 1e-6),
+        max(2 * guess_A_oiii, 1e-6),
+        max(2 * guess_A_ha, 1e-6), ha_center + delta_mu,
         R_nii_hi, R_sii_hi,
         sigma_int_hi,
         m_bound, b_range,
@@ -454,7 +454,13 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
         plt.tight_layout()
         plt.show()
  
-    return popt, delta_mu, m_bound, b_range, sigma_int_hi
+    amp_scales = {
+        'hb': guess_A_hb,
+        'oiii': guess_A_oiii,
+        'ha': guess_A_ha
+    }
+
+    return popt, delta_mu, m_bound, b_range, sigma_int_hi, amp_scales
 
 
 def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0.5007, ha_center=0.6563,
@@ -522,7 +528,7 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
           f"SII: SNR={snr_sii:.1f}, resolvable={sii_res}, fit={fit_sii}")
  
     # Initial parameter estimation
-    p0, delta_mu, m_bound, b_range, sigma_int_hi = initial_fits(
+    p0, delta_mu, m_bound, b_range, sigma_int_hi, amp_scales = initial_fits(
         wave, flux, flux_err, window, hb_center, oiii_center, ha_center,
         R_interp, fit_nii, fit_sii, diagnose=diagnose,
     )
@@ -564,8 +570,11 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
     ])
     pos += np.random.normal(0, 1e-10, pos.shape)   # break exact degeneracies
  
-    amp_max = max(float(np.nanmax(sigma_clip(flux, sigma=3, maxiters=5).compressed())),
-              float(np.nanmax(flux)), 1e-6)
+    amp_max = {
+        'hb': max(5 * amp_scales['hb'], 1e-6),
+        'oiii': max(5 * amp_scales['oiii'], 1e-6),
+        'ha': max(5 * amp_scales['ha'], 1e-6),
+    }
  
     # Run MCMC
     sampler = emcee.EnsembleSampler(

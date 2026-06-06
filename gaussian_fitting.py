@@ -471,7 +471,7 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
 
 def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0.5007, ha_center=0.6563,
                    window=0.01, snr_thresh_nii=SNR_THRESHOLD_NII, snr_thresh_sii=SNR_THRESHOLD_SII,
-                   nwalkers=32, steps=5000, burnin=3000, diagnose=False):
+                   nwalkers=32, steps=5000, burnin=3000, diagnose=False, pool=None):
     """
     Fit emission lines with MCMC and return posterior samples.
  
@@ -578,12 +578,13 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
  
     spec_max = float(np.nanmax(flux))
     amp_max = {
-        'hb':   max(5 * amp_scales['hb'], spec_max, 1e-6),
+        'hb': max(5 * amp_scales['hb'], spec_max, 1e-6),
         'oiii': max(5 * amp_scales['oiii'], spec_max, 1e-6),
-        'ha':   max(5 * amp_scales['ha'], spec_max, 1e-6),
+        'ha': max(5 * amp_scales['ha'], spec_max, 1e-6),
     }
  
     # Run MCMC
+    steps_needed = steps 
     with Pool() as pool:
         sampler = emcee.EnsembleSampler(
             nwalkers, ndim, log_probability,
@@ -595,7 +596,6 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
         )
         sampler.run_mcmc(pos, steps, progress=True)
 
-
     # Check acceptance fraction — should be 0.2–0.5
     acc_frac = np.mean(sampler.acceptance_fraction)
     print(f"  Mean acceptance fraction: {acc_frac:.3f}")
@@ -605,19 +605,19 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
     # Check autocorrelation time
     try:
         tau = sampler.get_autocorr_time(quiet=True)
-        max_tau = np.max(tau)
-        effective_steps = (steps - burnin) / max_tau
-        print(f"  Max autocorr time: {max_tau:.1f} steps, effective samples per walker: {effective_steps:.1f}")
-        if effective_steps < 50:
-            print(f"  WARNING: chain may not be converged (only {effective_steps:.1f} "
-                f"effective samples per walker). Consider increasing steps.")
-        converged = effective_steps >= 50
+        max_tau = np.nanmax(tau)
+        if np.isnan(max_tau):
+            effective_steps = 0.0
+        else:
+            effective_steps = (steps - burnin) / max_tau
+        print(f"  Max autocorr time: {max_tau:.1f}, "
+            f"effective samples per walker: {effective_steps:.1f}")
     except emcee.autocorr.AutocorrError:
-        print("  WARNING: autocorrelation time could not be estimated (chain too short)")
-        converged = False
+        effective_steps = 0.0
+        print("  WARNING: autocorrelation time could not be estimated")
 
-    fit_flags['converged'] = converged
-    fit_flags['acc_frac'] = acc_frac
+    fit_flags['effective_steps'] = float(effective_steps)
+    fit_flags['acc_frac'] = float(acc_frac)
  
     # Posterior processing
     flat = sampler.get_chain(discard=burnin, flat=True)

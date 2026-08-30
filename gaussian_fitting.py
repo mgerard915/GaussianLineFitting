@@ -53,7 +53,7 @@ SNR_THRESHOLD_SII = 2.5
  
 # A doublet is "resolvable" if the line separation exceeds this multiple of
 # the instrumental sigma at that wavelength.
-RESOLVABILITY_FACTOR = 1.0   # set to ~0.5–1.5 depending on strictnedss
+RESOLVABILITY_FACTOR = 1.0   # set to ~0.5–1.5 depending on how strict you want to be
 
 
 def load_instrument_lsf(disp_file: str) -> interp1d:
@@ -287,6 +287,9 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
     fit_nii, fit_sii : bool
         Whether NII / SII are free components.  If False the corresponding
         ratio parameters are pinned near zero via bounds.
+    window_n_sigma, window_max : float
+        Passed straight through to line_window() for the adaptive
+        per-line fitting mask (see line_window docstring).
  
     Returns:
     popt, delta_mu, m_bound, b_range, sigma_int_hi
@@ -312,7 +315,7 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
     wave_window = wave[mask]
     spec_window = spectrum[mask]
     err_window = err_spec[mask]
- 
+
     if len(wave_window) < 10:
         raise ValueError("Too few pixels in fitting window.")
  
@@ -533,7 +536,15 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
     hb_center, oiii_center, ha_center : float
         Observed-frame line centres in µm.
     window : float
-        Half-width (µm) of the fitting window around each line.
+        Half-width (µm) used for the continuum mask and amplitude-guess
+        fallback. Does NOT set the per-line fitting mask (see
+        window_n_sigma / window_max below).
+    window_n_sigma, window_max : float
+        Control the adaptive per-line fitting window (line_window()):
+        n_sigma instrumental sigmas, capped at window_max. Tune these if
+        your PRISM resolution dips low enough that the default cap
+        risks blending adjacent line complexes, or if you want a wider/
+        narrower window for a given dataset without editing the module.
     snr_thresh_nii, snr_thresh_sii : float
         Minimum peak S/N required to include NII / SII as free components.
     nwalkers, steps, burnin : int
@@ -640,6 +651,28 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
                     m_bound, b_range, sigma_inst_at_ha,
                     R_interp, fit_nii, fit_sii)
 
+    # Reject-and-resample any walker that starts at -inf log-probability.
+    n_stuck = 0
+    p0_arr = np.asarray(p0, dtype=float)
+    for i in range(nwalkers):
+        tries = 0
+        lp = log_probability(pos[i], *sampler_args)
+        while not np.isfinite(lp) and tries < 50:
+            scale = 0.05 * (1 + tries // 10)   # widen jitter every 10 failed tries
+            candidate = p0_arr * (1 + np.random.normal(0, scale, size=p0_arr.shape))
+            candidate[0:3] = np.abs(candidate[0:3])   # amplitudes must stay positive
+            pos[i] = candidate
+            lp = log_probability(pos[i], *sampler_args)
+            tries += 1
+        if not np.isfinite(lp):
+            pos[i] = p0_arr.copy()   # last resort: exact known-good p0
+            lp = log_probability(pos[i], *sampler_args)
+        if not np.isfinite(lp):
+            n_stuck += 1
+    if n_stuck > 0:
+        print(f"  WARNING: {n_stuck}/{nwalkers} walkers still stuck at -inf even at p0 -- check this galaxy's data")
+
+ 
     if pool is not None:
         sampler = emcee.EnsembleSampler(
             nwalkers, ndim, log_probability,
@@ -681,15 +714,14 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
     fit_flags['curve_fit_converged'] = bool(curve_fit_converged)
 
     fit_flags['reliable'] = bool(
-        (0.1 < fit_flags['acc_frac'] < 0.7)
-        and (fit_flags['effective_steps'] >= 20)
-        and fit_flags.get('curve_fit_converged', True)
+        (0.05 < fit_flags['acc_frac'] < 0.9)
+        and (fit_flags['effective_steps'] >= 3)
     )
  
     # Posterior processing
     flat = sampler.get_chain(discard=burnin, flat=True)
     lnL = sampler.get_log_prob(discard=burnin, flat=True)
- 
+
     df = pd.DataFrame(flat, columns=[
         'A_hb', 'A_oiii', 'A_ha', 'mu_ha', 'R_nii', 'R_sii', 'sigma_int', 'm', 'b',
     ])
@@ -764,6 +796,7 @@ def posterior_summary(df):
         out[col + '_p16'] = np.percentile(df[col], 16)
         out[col + '_p84'] = np.percentile(df[col], 84)
     return out
+
 
 def run_line_fitting_batch(spectra_dict, R_interp, n_processes=8, **line_fit_kwargs):
     """

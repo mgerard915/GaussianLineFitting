@@ -7,7 +7,7 @@ NII and SII are only fit if they are (a) covered without a chip gap,
 (b) detected above a S/N threshold, and (c) resolvable given the
 instrumental line spread function.
  
-Usage:
+Usage (single galaxy):
     from gaussian_fitting import line_fitting, load_instrument_lsf
  
     R_interp = load_instrument_lsf("jwst_nirspec_prism_disp.fits")
@@ -15,6 +15,16 @@ Usage:
         wave_seg, flux_seg, err_seg,
         hb_center=HBETA_obs, oiii_center=OIII_5007_obs, ha_center=HALPHA_obs,
         R_interp=R_interp
+    )
+
+Usage (full sample, one shared process pool):
+    from gaussian_fitting import run_line_fitting_batch, load_instrument_lsf
+
+    R_interp = load_instrument_lsf("jwst_nirspec_prism_disp.fits")
+    spectra_dict = {ID: (wave, flux, flux_err) for ID in sample_ids}
+    results = run_line_fitting_batch(
+        spectra_dict, R_interp, n_processes=8,
+        hb_center=HBETA_obs, oiii_center=OIII_5007_obs, ha_center=HALPHA_obs,
     )
 """
 
@@ -43,7 +53,7 @@ SNR_THRESHOLD_SII = 2.5
  
 # A doublet is "resolvable" if the line separation exceeds this multiple of
 # the instrumental sigma at that wavelength.
-RESOLVABILITY_FACTOR = 1.0   # set to ~0.5–1.5 depending on how strict you want to be
+RESOLVABILITY_FACTOR = 1.0   # set to ~0.5–1.5 depending on strictnedss
 
 
 def load_instrument_lsf(disp_file: str) -> interp1d:
@@ -68,6 +78,17 @@ def inst_sigma(lam, R_interp):
     The 0.7 factor accounts for the NIRSpec PRISM pixel sampling.
     """
     return lam / (2.355 * R_interp(lam)) * 0.7
+
+
+def line_window(center, R_interp, n_sigma=8, min_window=0.003, max_window=0.05):
+    """
+    Adaptive fitting half-width for a single line: n_sigma instrumental
+    sigmas at that wavelength, floored at min_window (so very
+    high-resolution regions don't collapse to an unusably tiny window)
+    and capped at max_window (so low-R regions of PRISM don't balloon
+    the window wide enough to blend adjacent line complexes together).
+    """
+    return np.clip(n_sigma * inst_sigma(center, R_interp), min_window, max_window)
 
 
 def gaussian(x, A, mu, sigma):
@@ -105,16 +126,14 @@ def full_line_model(x, A_hb, A_oiii, A_ha, mu_ha, R_nii, R_sii,
     mu_sii_6716 = mu_ha * 6716 / 6563
     mu_sii_6731 = mu_ha * 6731 / 6563
  
-    all_mus  = np.array([mu_hb, mu_oiii_5007, mu_oiii_4959,
-                         mu_nii_6583, mu_nii_6548,
-                         mu_sii_6716, mu_sii_6731, mu_ha])
+    all_mus  = np.array([mu_hb, mu_oiii_5007, mu_oiii_4959, 
+                        mu_nii_6583, mu_nii_6548, mu_sii_6716, mu_sii_6731, mu_ha])
     all_inst = inst_sigma(all_mus, R_interp)
  
     def sigma_tot(inst):
         return np.sqrt(sigma_int ** 2 + inst ** 2)
  
-    (sig_hb, sig_oiii, sig_oiii_4959,
-     sig_nii_6583, sig_nii_6548,
+    (sig_hb, sig_oiii, sig_oiii_4959, sig_nii_6583, sig_nii_6548,
      sig_sii_6716, sig_sii_6731, sig_ha) = sigma_tot(all_inst)
  
     A_nii = (R_nii * A_ha) if fit_nii else 0.0
@@ -142,8 +161,7 @@ def make_model_wrapper(R_interp, fit_nii, fit_sii):
     def wrapper(x, A_hb, A_oiii, A_ha, mu_ha, R_nii, R_sii,
                 sigma_int, m, b):
         return full_line_model(x, A_hb, A_oiii, A_ha, mu_ha, R_nii, R_sii,
-                                 sigma_int, m, b,
-                                 R_interp=R_interp,
+                                 sigma_int, m, b, R_interp=R_interp, 
                                  fit_nii=fit_nii, fit_sii=fit_sii)
     return wrapper
 
@@ -190,7 +208,7 @@ def check_line_covered(wave, center, R_interp, n_sigma=3):
     """
     Return True if there are spectral pixels within ±n_sigma * sigma_inst of center.
     """
-    hw  = n_sigma * inst_sigma(center, R_interp)
+    hw = n_sigma * inst_sigma(center, R_interp)
     nearby = np.sum((wave > center - hw) & (wave < center + hw))
     return nearby > 0
 
@@ -242,8 +260,8 @@ def log_prior(theta, ha_center, amp_max_dict, sigma_int_max, delta_mu,
     # Centroid must be within delta_mu of the expected Halpha position
     if not (ha_center - delta_mu < mu_ha < ha_center + delta_mu): return -np.inf
     # Constrain slope and intercept to reasonable ranges
-    if not (-m_bound < m < m_bound):  return -np.inf
-    if not (-b_range < b < b_range):  return -np.inf
+    if not (-m_bound < m < m_bound): return -np.inf
+    if not (-b_range < b < b_range): return -np.inf
  
     return 0.0
 
@@ -260,7 +278,8 @@ def log_probability(theta, x, y, yerr, ha_center, amp_max_dict, sigma_int_max, d
 
 
 def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_center,
-                 R_interp, fit_nii, fit_sii, diagnose=False):
+                 R_interp, fit_nii, fit_sii, diagnose=False,
+                 window_n_sigma=8, window_max=0.05):
     """
     Use curve_fit to get a starting point for MCMC.
  
@@ -276,16 +295,23 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
     sii_6731_center = ha_center * 6731 / 6563
  
     # build fitting window; everything outside of cutouts is ignored in the fit
+    w_hb = line_window(hb_center, R_interp, n_sigma=window_n_sigma, max_window=window_max)
+    w_oiii = line_window(oiii_center, R_interp, n_sigma=window_n_sigma, max_window=window_max)
+    w_ha = line_window(ha_center, R_interp, n_sigma=window_n_sigma, max_window=window_max)
+    w_sii1 = line_window(sii_6716_center, R_interp, n_sigma=window_n_sigma, max_window=window_max)
+    w_sii2 = line_window(sii_6731_center, R_interp, n_sigma=window_n_sigma, max_window=window_max)
+
     mask = (
-        ((wave > hb_center - window) & (wave < hb_center + window)) |
-        ((wave > oiii_center - window) & (wave < oiii_center + window)) |
-        ((wave > ha_center - window) & (wave < ha_center + window)) |
-        ((wave > sii_6716_center - window) & (wave < sii_6716_center + window)) |
-        ((wave > sii_6731_center - window) & (wave < sii_6731_center + window))
+        ((wave > hb_center - w_hb) & (wave < hb_center + w_hb)) |
+        ((wave > oiii_center - w_oiii) & (wave < oiii_center + w_oiii)) |
+        ((wave > ha_center - w_ha) & (wave < ha_center + w_ha)) |
+        ((wave > sii_6716_center - w_sii1) & (wave < sii_6716_center + w_sii1)) |
+        ((wave > sii_6731_center - w_sii2) & (wave < sii_6731_center + w_sii2))
     )
+
     wave_window = wave[mask]
     spec_window = spectrum[mask]
-    err_window  = err_spec[mask]
+    err_window = err_spec[mask]
  
     if len(wave_window) < 10:
         raise ValueError("Too few pixels in fitting window.")
@@ -325,8 +351,8 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
     
     # Set bounds for slope and intercept based on continuum variability and noise level
     spec_rms = np.nanstd(spec_window)
-    m_bound  = max(abs(guess_m) * 3, spec_rms / (wave_window[-1] - wave_window[0]) * 5)
-    b_range  = max(abs(guess_b) * 3, spec_rms * 5, np.nanmax(np.abs(spec_window)) * 1.5)
+    m_bound = max(abs(guess_m) * 3, spec_rms / (wave_window[-1] - wave_window[0]) * 5)
+    b_range = max(abs(guess_b) * 3, spec_rms * 5, np.nanmax(np.abs(spec_window)) * 1.5)
  
     # Guess sigma from Halpha FWHM 
     sigma_inst_at_ha = inst_sigma(ha_center, R_interp)
@@ -362,6 +388,14 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
     def cont_at(lam):
         return guess_m * lam + guess_b
 
+    # Floor for degenerate amplitude guesses, scaled to the actual noise level
+    # of this spectrum rather than a fixed absolute number. A hardcoded value
+    # like 1e-6 silently overrides every real guess for spectra in cgs
+    # flambda units (~1e-17 to 1e-20), which defeats the point of estimating
+    # an initial amplitude at all.
+    _err_med = np.nanmedian(err_window)
+    amp_floor = 1e-3 * _err_med if (np.isfinite(_err_med) and _err_med > 0) else 1e-6
+
     # subtracts continuum and averages pixels to get a rough line amplitude guess
     def line_amp_guess(center):
         hw  = 2 * inst_sigma(center, R_interp)
@@ -370,12 +404,12 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
             hw  = window / 4
             lmask = (wave_window > center - hw) & (wave_window < center + hw)
         if lmask.sum() == 0:
-            return 1e-6
+            return amp_floor
         w = np.exp(-0.5 * ((wave_window[lmask] - center) / inst_sigma(center, R_interp)) ** 2)
         if w.sum() == 0:
-            return 1e-6
+            return amp_floor
         val = np.average(spec_window[lmask] - cont_at(wave_window[lmask]), weights=w)
-        return max(float(val), 1e-6)
+        return max(float(val), amp_floor)
  
     guess_A_ha = line_amp_guess(ha_center)
     guess_A_oiii = line_amp_guess(oiii_center)
@@ -429,18 +463,35 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
     p0 = np.clip(p0, np.array(low_bounds) + eps, np.array(high_bounds) - eps)
  
     model_fn = make_model_wrapper(R_interp, fit_nii, fit_sii)
- 
-    try:
-        popt, _ = curve_fit(
-            model_fn, wave_window, spec_window,
-            p0=p0,
-            sigma=err_window,
-            bounds=(low_bounds, high_bounds),
-            maxfev=30_000,
-        )
-    except RuntimeError:
-        print("curve_fit did not converge; using p0 as fallback.")
+
+    # Try the standard guess first, then a few alternate sigma seeds if it fails.
+    sigma_seed_multipliers = [1.0, 2.0, 0.5, 4.0]
+    popt = None
+    converged = False
+    best_resid = np.inf
+
+    for mult in sigma_seed_multipliers:
+        p0_try = np.array(p0, dtype=float)
+        p0_try[6] = np.clip(guess_sigma_int * mult, low_bounds[6] + 1e-10, high_bounds[6] - 1e-10)
+        try:
+            popt_try, _ = curve_fit(
+                model_fn, wave_window, spec_window,
+                p0=p0_try, sigma=err_window,
+                bounds=(low_bounds, high_bounds),
+                maxfev=30_000,
+            )
+            resid = np.sum(((spec_window - model_fn(wave_window, *popt_try)) / err_window) ** 2)
+            if resid < best_resid:
+                best_resid = resid
+                popt = popt_try
+                converged = True
+        except RuntimeError:
+            continue
+
+    if popt is None:
+        print("curve_fit did not converge on any seed; using p0 as fallback.")
         popt = np.array(p0)
+        converged = False
  
     if diagnose:
         fig, ax = plt.subplots(figsize=(9, 4))
@@ -460,18 +511,15 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
         plt.tight_layout()
         plt.show()
  
-    amp_scales = {
-        'hb': popt[0],
-        'oiii': popt[1],
-        'ha': popt[2]
-    }
+    amp_scales = {'hb': popt[0], 'oiii': popt[1], 'ha': popt[2]}
 
-    return popt, delta_mu, m_bound, b_range, sigma_int_hi, amp_scales
+    return popt, delta_mu, m_bound, b_range, sigma_int_hi, amp_scales, converged
 
 
 def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0.5007, ha_center=0.6563,
                    window=0.01, snr_thresh_nii=SNR_THRESHOLD_NII, snr_thresh_sii=SNR_THRESHOLD_SII,
-                   nwalkers=32, steps=5000, burnin=3000, diagnose=False, pool=None):
+                   nwalkers=32, steps=5000, burnin=3000, diagnose=False, pool=None,
+                   window_n_sigma=8, window_max=0.05):
     """
     Fit emission lines with MCMC and return posterior samples.
  
@@ -534,9 +582,10 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
           f"SII: SNR={snr_sii:.1f}, resolvable={sii_res}, fit={fit_sii}")
  
     # Initial parameter estimation
-    p0, delta_mu, m_bound, b_range, sigma_int_hi, amp_scales = initial_fits(
+    p0, delta_mu, m_bound, b_range, sigma_int_hi, amp_scales, curve_fit_converged = initial_fits(
         wave, flux, flux_err, window, hb_center, oiii_center, ha_center,
         R_interp, fit_nii, fit_sii, diagnose=diagnose,
+        window_n_sigma=window_n_sigma, window_max=window_max,
     )
  
     # MCMC initialisation
@@ -583,18 +632,29 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
         'ha': max(5 * amp_scales['ha'], spec_max, 1e-6),
     }
  
-    # Run MCMC
-    steps_needed = steps 
-    with Pool() as pool:
+    # Run MCMC. If a pool was passed in (e.g. by run_line_fitting_batch),
+    # reuse it instead of spawning a new one for every galaxy.
+    steps_needed = steps
+    sampler_args = (wave, flux, flux_err,
+                    ha_center, amp_max, sigma_int_hi, delta_mu,
+                    m_bound, b_range, sigma_inst_at_ha,
+                    R_interp, fit_nii, fit_sii)
+
+    if pool is not None:
         sampler = emcee.EnsembleSampler(
             nwalkers, ndim, log_probability,
-            args=(wave, flux, flux_err,
-                ha_center, amp_max, sigma_int_hi, delta_mu,
-                m_bound, b_range, sigma_inst_at_ha,
-                R_interp, fit_nii, fit_sii),
+            args=sampler_args,
             pool=pool,
         )
         sampler.run_mcmc(pos, steps, progress=True)
+    else:
+        with Pool() as local_pool:
+            sampler = emcee.EnsembleSampler(
+                nwalkers, ndim, log_probability,
+                args=sampler_args,
+                pool=local_pool,
+            )
+            sampler.run_mcmc(pos, steps, progress=True)
 
     # Check acceptance fraction — should be 0.2–0.5
     acc_frac = np.mean(sampler.acceptance_fraction)
@@ -618,10 +678,17 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
 
     fit_flags['effective_steps'] = float(effective_steps)
     fit_flags['acc_frac'] = float(acc_frac)
+    fit_flags['curve_fit_converged'] = bool(curve_fit_converged)
+
+    fit_flags['reliable'] = bool(
+        (0.1 < fit_flags['acc_frac'] < 0.7)
+        and (fit_flags['effective_steps'] >= 20)
+        and fit_flags.get('curve_fit_converged', True)
+    )
  
     # Posterior processing
     flat = sampler.get_chain(discard=burnin, flat=True)
-    lnL  = sampler.get_log_prob(discard=burnin, flat=True)
+    lnL = sampler.get_log_prob(discard=burnin, flat=True)
  
     df = pd.DataFrame(flat, columns=[
         'A_hb', 'A_oiii', 'A_ha', 'mu_ha', 'R_nii', 'R_sii', 'sigma_int', 'm', 'b',
@@ -697,3 +764,39 @@ def posterior_summary(df):
         out[col + '_p16'] = np.percentile(df[col], 16)
         out[col + '_p84'] = np.percentile(df[col], 84)
     return out
+
+def run_line_fitting_batch(spectra_dict, R_interp, n_processes=8, **line_fit_kwargs):
+    """
+    Run line_fitting() over a full sample using ONE shared process pool,
+    instead of spawning a new Pool() inside line_fitting() for every galaxy.
+ 
+    Parameters
+    ----------
+    spectra_dict : dict
+        {ID: (wave, flux, flux_err)} for every galaxy to fit.
+    R_interp : callable
+        Spectral resolution interpolator from load_instrument_lsf().
+    n_processes : int
+        Number of worker processes to use for the shared pool. Keep this
+        at or below the number of cores you actually have available.
+    **line_fit_kwargs :
+        Passed straight through to line_fitting() (e.g. hb_center,
+        oiii_center, ha_center, window, steps, burnin, nwalkers, diagnose).
+ 
+    Returns
+    -------
+    results : dict
+        {ID: (wave, flux, flux_err, df, fit_flags)} on success,
+        {ID: None} for any galaxy that raised an exception.
+    """
+    results = {}
+    with Pool(processes=n_processes) as pool:
+        for ID, (wave, flux, flux_err) in spectra_dict.items():
+            print(f"--- Fitting {ID} ---")
+            try:
+                out = line_fitting(wave, flux, flux_err, R_interp, pool=pool, **line_fit_kwargs)
+                results[ID] = out
+            except Exception as e:
+                print(f"  → Skipping {ID}: {e}")
+                results[ID] = None
+    return results

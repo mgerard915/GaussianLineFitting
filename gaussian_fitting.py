@@ -17,7 +17,7 @@ Usage (single galaxy):
         R_interp=R_interp
     )
 
-Usage (full sample, one shared process pool):
+Usage (full sample, already-loaded spectra, one galaxy per core):
     from gaussian_fitting import run_line_fitting_batch, load_instrument_lsf
 
     R_interp = load_instrument_lsf("jwst_nirspec_prism_disp.fits")
@@ -26,9 +26,25 @@ Usage (full sample, one shared process pool):
         spectra_dict, R_interp, n_processes=8,
         hb_center=HBETA_obs, oiii_center=OIII_5007_obs, ha_center=HALPHA_obs,
     )
+
+Usage (full sample, straight from a catalog CSV + Campfire spectra, one
+galaxy per core):
+    from gaussian_fitting import run_photspec_batch, load_instrument_lsf
+    import pandas as pd
+
+    R_interp = load_instrument_lsf("jwst_nirspec_prism_disp.fits")
+    catalog = pd.read_csv("CEERS_photspec_1.csv")  # needs object_id, z_spec, ID_spec
+    results_df = run_photspec_batch(
+        catalog, R_interp,
+        output_csv="CEERS_fitted.csv",
+        plot_dir="./triple_line_plots/CEERS",
+        n_processes=8,
+    )
 """
 
 import os
+import traceback
+from functools import partial
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -83,10 +99,7 @@ def inst_sigma(lam, R_interp):
 def line_window(center, R_interp, n_sigma=8, min_window=0.003, max_window=0.05):
     """
     Adaptive fitting half-width for a single line: n_sigma instrumental
-    sigmas at that wavelength, floored at min_window (so very
-    high-resolution regions don't collapse to an unusably tiny window)
-    and capped at max_window (so low-R regions of PRISM don't balloon
-    the window wide enough to blend adjacent line complexes together).
+    sigmas at that wavelength, floored at min_window and capped at max_window 
     """
     return np.clip(n_sigma * inst_sigma(center, R_interp), min_window, max_window)
 
@@ -217,9 +230,6 @@ def check_sii_resolvable(sii_6716_center, sii_6731_center, R_interp):
     """
     Return True if the SII doublet separation exceeds RESOLVABILITY_FACTOR
     times the instrumental sigma at the doublet midpoint.
- 
-    At NIRSpec PRISM resolution the two lines are often unresolved; in that
-    case fitting them as a free doublet is unreliable.
     """
     midpoint  = 0.5 * (sii_6716_center + sii_6731_center)
     sep = sii_6731_center - sii_6716_center
@@ -392,10 +402,7 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
         return guess_m * lam + guess_b
 
     # Floor for degenerate amplitude guesses, scaled to the actual noise level
-    # of this spectrum rather than a fixed absolute number. A hardcoded value
-    # like 1e-6 silently overrides every real guess for spectra in cgs
-    # flambda units (~1e-17 to 1e-20), which defeats the point of estimating
-    # an initial amplitude at all.
+    # of this spectrum rather than a fixed absolute number.
     _err_med = np.nanmedian(err_window)
     amp_floor = 1e-3 * _err_med if (np.isfinite(_err_med) and _err_med > 0) else 1e-6
 
@@ -461,9 +468,20 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
         m_bound, b_range,
     ]
  
-    # Clamp p0 inside bounds with a small buffer
-    eps = 1e-10
-    p0 = np.clip(p0, np.array(low_bounds) + eps, np.array(high_bounds) - eps)
+    # Clamp p0 inside bounds with a small buffer, scaled to each parameter's
+    # own bound span rather than a fixed absolute epsilon. 
+    low_arr = np.array(low_bounds, dtype=float)
+    high_arr = np.array(high_bounds, dtype=float)
+    span = high_arr - low_arr
+    if np.any(span <= 0):
+        bad = np.where(span <= 0)[0]
+        names = ['A_hb', 'A_oiii', 'A_ha', 'mu_ha', 'R_nii', 'R_sii', 'sigma_int', 'm', 'b']
+        details = ", ".join(
+            f"{names[i]} (low={low_arr[i]:.3g}, high={high_arr[i]:.3g})" for i in bad
+        )
+        raise ValueError(f"Degenerate parameter bounds: {details}")
+    eps = span * 1e-6
+    p0 = np.clip(p0, low_arr + eps, high_arr - eps)
  
     model_fn = make_model_wrapper(R_interp, fit_nii, fit_sii)
 
@@ -521,8 +539,7 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
 
 def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0.5007, ha_center=0.6563,
                    window=0.01, snr_thresh_nii=SNR_THRESHOLD_NII, snr_thresh_sii=SNR_THRESHOLD_SII,
-                   nwalkers=32, steps=5000, burnin=3000, diagnose=False, pool=None,
-                   window_n_sigma=8, window_max=0.05):
+                   nwalkers=32, steps=5000, burnin=3000, diagnose=False, window_n_sigma=8, window_max=0.05):
     """
     Fit emission lines with MCMC and return posterior samples.
  
@@ -541,10 +558,7 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
         window_n_sigma / window_max below).
     window_n_sigma, window_max : float
         Control the adaptive per-line fitting window (line_window()):
-        n_sigma instrumental sigmas, capped at window_max. Tune these if
-        your PRISM resolution dips low enough that the default cap
-        risks blending adjacent line complexes, or if you want a wider/
-        narrower window for a given dataset without editing the module.
+        n_sigma instrumental sigmas, capped at window_max. 
     snr_thresh_nii, snr_thresh_sii : float
         Minimum peak S/N required to include NII / SII as free components.
     nwalkers, steps, burnin : int
@@ -642,10 +656,7 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
         'oiii': max(5 * amp_scales['oiii'], spec_max, 1e-6),
         'ha': max(5 * amp_scales['ha'], spec_max, 1e-6),
     }
- 
-    # Run MCMC. If a pool was passed in (e.g. by run_line_fitting_batch),
-    # reuse it instead of spawning a new one for every galaxy.
-    steps_needed = steps
+
     sampler_args = (wave, flux, flux_err,
                     ha_center, amp_max, sigma_int_hi, delta_mu,
                     m_bound, b_range, sigma_inst_at_ha,
@@ -673,21 +684,11 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
         print(f"  WARNING: {n_stuck}/{nwalkers} walkers still stuck at -inf even at p0 -- check this galaxy's data")
 
  
-    if pool is not None:
-        sampler = emcee.EnsembleSampler(
-            nwalkers, ndim, log_probability,
-            args=sampler_args,
-            pool=pool,
-        )
-        sampler.run_mcmc(pos, steps, progress=True)
-    else:
-        with Pool() as local_pool:
-            sampler = emcee.EnsembleSampler(
-                nwalkers, ndim, log_probability,
-                args=sampler_args,
-                pool=local_pool,
-            )
-            sampler.run_mcmc(pos, steps, progress=True)
+    sampler = emcee.EnsembleSampler(
+        nwalkers, ndim, log_probability,
+        args=sampler_args,
+    )
+    sampler.run_mcmc(pos, steps, progress=True)
 
     # Check acceptance fraction — should be 0.2–0.5
     acc_frac = np.mean(sampler.acceptance_fraction)
@@ -798,10 +799,20 @@ def posterior_summary(df):
     return out
 
 
+def _fit_one_spectrum(item, R_interp, line_fit_kwargs):
+    """Worker for run_line_fitting_batch: fits one already-loaded spectrum."""
+    ID, (wave, flux, flux_err) = item
+    try:
+        out = line_fitting(wave, flux, flux_err, R_interp, **line_fit_kwargs)
+        return ID, out, None
+    except Exception as e:
+        return ID, None, f"{e}\n{traceback.format_exc()}"
+
+
 def run_line_fitting_batch(spectra_dict, R_interp, n_processes=8, **line_fit_kwargs):
     """
-    Run line_fitting() over a full sample using ONE shared process pool,
-    instead of spawning a new Pool() inside line_fitting() for every galaxy.
+    Run line_fitting() over a full sample of already-loaded spectra,
+    fitting up to n_processes galaxies concurrently -- one per core.
  
     Parameters
     ----------
@@ -810,8 +821,7 @@ def run_line_fitting_batch(spectra_dict, R_interp, n_processes=8, **line_fit_kwa
     R_interp : callable
         Spectral resolution interpolator from load_instrument_lsf().
     n_processes : int
-        Number of worker processes to use for the shared pool. Keep this
-        at or below the number of cores you actually have available.
+        Number of worker processes.
     **line_fit_kwargs :
         Passed straight through to line_fitting() (e.g. hb_center,
         oiii_center, ha_center, window, steps, burnin, nwalkers, diagnose).
@@ -823,13 +833,326 @@ def run_line_fitting_batch(spectra_dict, R_interp, n_processes=8, **line_fit_kwa
         {ID: None} for any galaxy that raised an exception.
     """
     results = {}
+    worker = partial(_fit_one_spectrum, R_interp=R_interp, line_fit_kwargs=line_fit_kwargs)
     with Pool(processes=n_processes) as pool:
-        for ID, (wave, flux, flux_err) in spectra_dict.items():
-            print(f"--- Fitting {ID} ---")
-            try:
-                out = line_fitting(wave, flux, flux_err, R_interp, pool=pool, **line_fit_kwargs)
+        for ID, out, err in pool.imap_unordered(worker, spectra_dict.items()):
+            if err is None:
+                print(f"--- Fitting {ID}: done ---")
                 results[ID] = out
-            except Exception as e:
-                print(f"  → Skipping {ID}: {e}")
+            else:
+                print(f"--- Fitting {ID}: FAILED ---\n  → {err}")
                 results[ID] = None
     return results
+
+
+_WORKER_CAMPFIRE = None
+_WORKER_CAMPFIRE_DATA_DIR = None
+
+
+def _init_campfire_worker(data_dir=None):
+    """
+    Pool initializer: create one Campfire client per worker process.
+
+    data_dir, if given, is passed straight to Campfire(data_dir=...),
+    overriding whatever $CAMPFIRE_ROOT happens to resolve to in this
+    process's environment.
+    """
+    global _WORKER_CAMPFIRE, _WORKER_CAMPFIRE_DATA_DIR
+    from campfire import Campfire
+    _WORKER_CAMPFIRE_DATA_DIR = data_dir
+    _WORKER_CAMPFIRE = Campfire(data_dir=data_dir) if data_dir else Campfire()
+
+
+def _get_worker_campfire():
+    """Return this worker's Campfire client, creating it on first use."""
+    global _WORKER_CAMPFIRE
+    if _WORKER_CAMPFIRE is None:
+        _init_campfire_worker(_WORKER_CAMPFIRE_DATA_DIR)
+    return _WORKER_CAMPFIRE
+
+
+def _process_photspec_row(idx_row, R_interp, window, window_n_sigma, window_max,
+                            plot_dir, line_fit_kwargs, grating='PRISM'):
+    """
+    Worker for run_photspec_batch: pulls one galaxy's spectrum via Campfire
+    (obj.spectra -> .open()), runs the full fitting + summary +
+    diagnostic-plot pipeline, and returns a plain dict of results (nothing
+    containing open file handles / plots, so it pickles cleanly back to
+    the parent process).
+    """
+    idx, row = idx_row
+    object_id = row["object_id"]
+    z = row["z_spec"]
+    spec_id = row["ID_spec"]
+
+    result = {'idx': idx, 'spec_id': spec_id, 'status': 'ok', 'message': None, 'data': None}
+
+    HBETA_obs = 0.4861 * (1 + z)
+    OIII_obs = 0.5007 * (1 + z)
+    OIII_4959 = 0.4959 * (1 + z)
+    HALPHA_obs = 0.6563 * (1 + z)
+    SII_6716 = 0.6716 * (1 + z)
+    SII_6731 = 0.6731 * (1 + z)
+    NII_6548 = 0.6548 * (1 + z)
+    NII_6583 = 0.6583 * (1 + z)
+
+    try:
+        cf = _get_worker_campfire()
+        obj = cf.get_object(object_id)
+        candidates = obj.spectra[obj.spectra.grating == grating]
+        if len(candidates) == 0:
+            result['status'] = 'skip'
+            result['message'] = f"No {grating} spectrum found for {object_id}."
+            return result
+        if len(candidates) > 1:
+            # More than one PRISM spectrum (e.g. multiple programs/visits) --
+            # take the highest S/N one.
+            spec_row = candidates[np.argmax(candidates.signal_to_noise)]
+        else:
+            spec_row = candidates[0]
+        spec = cf.open_spectrum(spec_row.spectrum_id)
+    except Exception as e:
+        result['status'] = 'skip'
+        result['message'] = f"Spectrum retrieval FAILED: {e}"
+        return result
+
+    wave_obs = spec.wavelength
+    flux_raw = spec.flam        # erg/s/cm^2/A -- matches this module's flux-unit assumptions
+    err_raw = spec.flam_err
+    good = spec.valid            # canonical finite-flux & positive-error mask
+
+    wave_c = wave_obs[good]
+    flux_c = flux_raw[good]
+    err_c = err_raw[good]
+
+    if len(wave_c) < 10:
+        result['status'] = 'skip'
+        result['message'] = "Too few good pixels."
+        return result
+
+    if not (wave_c.min() < HBETA_obs < wave_c.max()):
+        result['status'] = 'skip'
+        result['message'] = "Hβ not in wavelength coverage."
+        return result
+    if not (wave_c.min() < HALPHA_obs < wave_c.max()):
+        result['status'] = 'skip'
+        result['message'] = "Hα not in wavelength coverage."
+        return result
+
+    seg = (wave_c > HBETA_obs - 0.08) & (wave_c < SII_6731 + 0.08)
+    wave_seg = wave_c[seg]
+    flux_seg = flux_c[seg]
+    err_seg = err_c[seg]
+
+    if len(wave_seg) < 10:
+        result['status'] = 'skip'
+        result['message'] = "Too few pixels in segment."
+        return result
+
+    try:
+        wave_fit, flux_fit, err_fit, df, fit_flags = line_fitting(
+            wave_seg, flux_seg, err_seg,
+            R_interp=R_interp,
+            hb_center=HBETA_obs, oiii_center=OIII_obs, ha_center=HALPHA_obs,
+            window=window, window_n_sigma=window_n_sigma, window_max=window_max,
+            diagnose=False,
+            **line_fit_kwargs,
+        )
+    except ValueError as e:
+        result['status'] = 'skip'
+        result['message'] = f"Skipping (coverage/setup): {e}"
+        return result
+    except Exception as e:
+        result['status'] = 'error'
+        result['message'] = f"Fitting FAILED: {e}\n{traceback.format_exc()}"
+        return result
+
+    try:
+        summ = posterior_summary(df)
+        data = {
+            'Hb_flux': summ['Flux_Hb'], 'Hb_err': summ['Flux_Hb_err'],
+            'Ha_flux': summ['Flux_Ha'], 'Ha_err': summ['Flux_Ha_err'],
+            'OIII_flux': summ['Flux_OIII'], 'OIII_err': summ['Flux_OIII_err'],
+            'SII_flux': summ['Flux_SII'], 'SII_err': summ['Flux_SII_err'],
+            'Hb_SNR': summ['Flux_Hb_snr'], 'Ha_SNR': summ['Flux_Ha_snr'],
+            'fit_nii': int(fit_flags['fit_nii']), 'fit_sii': int(fit_flags['fit_sii']),
+            'snr_nii_prefit': fit_flags['snr_nii'], 'snr_sii_prefit': fit_flags['snr_sii'],
+        }
+
+        if not fit_flags['fit_sii']:
+            data['SII_flux'] = np.nan
+            data['SII_err'] = np.nan
+
+        data['A_ha_snr'] = np.median(df['A_ha']) / (
+            (np.percentile(df['A_ha'], 84) - np.percentile(df['A_ha'], 16)) / 2
+        )
+
+        med_params = df.quantile(0.5)[
+            ['A_hb', 'A_oiii', 'A_ha', 'mu_ha', 'R_nii', 'R_sii', 'sigma_int', 'm', 'b']
+        ].values
+        residuals = (flux_fit - full_line_model(
+            wave_fit, *med_params, R_interp=R_interp,
+            fit_nii=fit_flags['fit_nii'], fit_sii=fit_flags['fit_sii']
+        )) / err_fit
+        data['chi2_red'] = np.sum(residuals ** 2) / (len(flux_fit) - 9)
+
+        data['Ha_flux_p16'] = summ['Flux_Ha_p16']
+        data['Hb_flux_p16'] = summ['Flux_Hb_p16']
+        data['Ha_flux_p84'] = summ['Flux_Ha_p84']
+        data['Hb_flux_p84'] = summ['Flux_Hb_p84']
+
+        bd = df['Flux_Ha'] / df['Flux_Hb'].replace(0, np.nan)
+        bd_clean = bd.dropna()
+        data['Balmer_dec'] = np.median(bd_clean)
+        data['Balmer_dec_err'] = (np.percentile(bd_clean, 84) - np.percentile(bd_clean, 16)) / 2
+
+        # E(B-V) using Calzetti+2000 attenuation law:
+        #   E(B-V) = 1.97 * log10((Ha/Hb) / 2.86)   [2.86 = Case B Balmer decrement]
+        with np.errstate(invalid='ignore', divide='ignore'):
+            ebv = 1.97 * np.log10(bd / 2.86)
+        ebv_clean = ebv.dropna()
+        data['EBV'] = np.median(ebv_clean)
+        data['EBV_err'] = (np.percentile(ebv_clean, 84) - np.percentile(ebv_clean, 16)) / 2
+
+        data['effective_steps'] = fit_flags['effective_steps']
+        data['acc_frac'] = fit_flags['acc_frac']
+        data['converged'] = int(fit_flags.get('curve_fit_converged', True))
+        data['reliable'] = int(fit_flags.get('reliable', False))
+
+        result['data'] = data
+    except Exception as e:
+        result['status'] = 'error'
+        result['message'] = f"Result extraction FAILED: {e}"
+        return result
+
+    if plot_dir is not None:
+        try:
+            med_params = df.quantile(0.5)[
+                ['A_hb', 'A_oiii', 'A_ha', 'mu_ha', 'R_nii', 'R_sii', 'sigma_int', 'm', 'b']
+            ].values
+            xarr = np.linspace(HBETA_obs - 0.1, SII_6731 + 0.1, 1200)
+            model_curve = full_line_model(
+                xarr, *med_params, R_interp=R_interp,
+                fit_nii=fit_flags['fit_nii'], fit_sii=fit_flags['fit_sii']
+            )
+
+            fig, ax = plt.subplots(figsize=(11, 5))
+            ax.step(wave_fit, flux_fit, where='mid', color='black', alpha=0.6, label='Data')
+            ax.fill_between(wave_fit, flux_fit - err_fit, flux_fit + err_fit, alpha=0.2, color='grey')
+            ax.plot(xarr, model_curve, color='royalblue', lw=1.8, label='Model')
+
+            for lam, lbl, col, ls in [
+                (HBETA_obs, 'Hβ', 'steelblue', '--'),
+                (OIII_4959, '[OIII]4959', 'olivedrab', ':'),
+                (OIII_obs, '[OIII]5007', 'seagreen', '--'),
+                (HALPHA_obs, 'Hα', 'mediumpurple', '--'),
+                (SII_6716, '[SII]6716', 'darkorange', '--'),
+                (SII_6731, '[SII]6731', 'darkorange', ':'),
+                (NII_6548, '[NII]6548', 'crimson', '--'),
+                (NII_6583, '[NII]6583', 'crimson', ':'),
+            ]:
+                ax.axvline(lam, color=col, ls=ls, lw=0.8, label=lbl)
+
+            flag_str = (f"NII={'fit' if fit_flags['fit_nii'] else 'fixed=0'} "
+                        f"(SNR={fit_flags['snr_nii']:.1f})  |  "
+                        f"SII={'fit' if fit_flags['fit_sii'] else 'fixed=0'} "
+                        f"(SNR={fit_flags['snr_sii']:.1f}, "
+                        f"res={'Y' if fit_flags['sii_resolvable'] else 'N'})")
+            ax.set_title(f"ID {spec_id}   z={z:.4f}\n{flag_str}", fontsize=9)
+            ax.legend(fontsize=7, ncol=4)
+            ax.set_xlabel('Wavelength (µm)')
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, f"fit_{spec_id}.png"), dpi=120)
+            plt.close(fig)
+        except Exception as e:
+            result['plot_message'] = f"Plot FAILED: {e}"
+
+    return result
+
+
+def run_photspec_batch(catalog_df, R_interp, output_csv, plot_dir=None,
+                        n_processes=8, checkpoint_every=10,
+                        window=0.03, window_n_sigma=8, window_max=0.05,
+                        grating='PRISM', campfire_data_dir=None,
+                        **line_fit_kwargs):
+    """
+    Fit emission lines for every row of a photspec catalog DataFrame
+    (columns: object_id, z_spec, ID_spec), fitting up to n_processes
+    galaxies concurrently -- one per core.
+
+    Parameters
+    ----------
+    catalog_df : pd.DataFrame
+        Must have 'object_id', 'z_spec', 'ID_spec' columns.
+    R_interp : callable
+        Spectral resolution interpolator from load_instrument_lsf().
+    output_csv : str
+        Path to write the results CSV (checkpointed periodically).
+    plot_dir : str or None
+        If given, diagnostic plots are saved here as fit_{ID_spec}.png.
+    n_processes : int
+        Number of worker processes.
+    checkpoint_every : int
+        Write output_csv to disk after this many completed rows.
+    window, window_n_sigma, window_max :
+        Passed through to the per-row fit (see line_fitting/line_window).
+    grating : str
+        Which grating's spectrum to fit for each object (default 'PRISM').
+        If an object has more than one spectrum in this grating (e.g.
+        multiple programs/visits), the highest-S/N one is used.
+    campfire_data_dir : str or None
+        Explicit Campfire data directory (contains meta/ and products/),
+        passed to Campfire(data_dir=...) in every worker process.
+    **line_fit_kwargs :
+        Any other kwargs to pass through to line_fitting (e.g. steps,
+        burnin, nwalkers, snr_thresh_nii, snr_thresh_sii).
+
+    Returns
+    -------
+    df_out : pd.DataFrame
+        catalog_df with all result columns filled in.
+    """
+    df_out = catalog_df.copy()
+    result_cols = [
+        'Hb_flux', 'Hb_err', 'Ha_flux', 'Ha_err', 'OIII_flux', 'OIII_err', 'SII_flux', 'SII_err',
+        'Hb_SNR', 'Ha_SNR', 'fit_nii', 'fit_sii', 'snr_nii_prefit', 'snr_sii_prefit',
+        'A_ha_snr', 'chi2_red', 'Ha_flux_p16', 'Hb_flux_p16', 'Ha_flux_p84', 'Hb_flux_p84',
+        'Balmer_dec', 'Balmer_dec_err', 'EBV', 'EBV_err', 'converged', 'reliable', 'acc_frac',
+        'effective_steps',
+    ]
+    for col in result_cols:
+        if col not in df_out.columns:
+            df_out[col] = np.nan
+
+    if plot_dir is not None:
+        os.makedirs(plot_dir, exist_ok=True)
+
+    worker = partial(
+        _process_photspec_row, R_interp=R_interp, window=window,
+        window_n_sigma=window_n_sigma, window_max=window_max,
+        plot_dir=plot_dir, line_fit_kwargs=line_fit_kwargs, grating=grating,
+    )
+
+    n_total = len(df_out)
+    n_done = 0
+    with Pool(processes=n_processes, initializer=_init_campfire_worker,
+              initargs=(campfire_data_dir,)) as pool:
+        for result in pool.imap_unordered(worker, df_out.iterrows()):
+            spec_id = result['spec_id']
+            n_done += 1
+            print(f"\n{'='*60}\n[{n_done}/{n_total}] ID {spec_id}: {result['status']}"
+                  + (f" -- {result['message']}" if result['message'] else ""))
+
+            if result['status'] == 'ok' and result['data'] is not None:
+                for k, v in result['data'].items():
+                    df_out.loc[result['idx'], k] = v
+            if result.get('plot_message'):
+                print(f"  → {result['plot_message']}")
+
+            if n_done % checkpoint_every == 0:
+                df_out.to_csv(output_csv, index=False)
+                print(f"  → Checkpoint saved ({n_done}/{n_total})")
+
+    df_out.to_csv(output_csv, index=False)
+    print(f"\nDone. Results written to {output_csv}")
+    return df_out

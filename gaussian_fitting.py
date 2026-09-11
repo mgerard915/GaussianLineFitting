@@ -6,29 +6,8 @@ using emcee MCMC with curve_fit initialisation.
 NII and SII are only fit if they are (a) covered without a chip gap,
 (b) detected above a S/N threshold, and (c) resolvable given the
 instrumental line spread function.
- 
-Usage (single galaxy):
-    from gaussian_fitting import line_fitting, load_instrument_lsf
- 
-    R_interp = load_instrument_lsf("jwst_nirspec_prism_disp.fits")
-    wave, flux, flux_err, df, fit_flags = line_fitting(
-        wave_seg, flux_seg, err_seg,
-        hb_center=HBETA_obs, oiii_center=OIII_5007_obs, ha_center=HALPHA_obs,
-        R_interp=R_interp
-    )
 
-Usage (full sample, already-loaded spectra, one galaxy per core):
-    from gaussian_fitting import run_line_fitting_batch, load_instrument_lsf
-
-    R_interp = load_instrument_lsf("jwst_nirspec_prism_disp.fits")
-    spectra_dict = {ID: (wave, flux, flux_err) for ID in sample_ids}
-    results = run_line_fitting_batch(
-        spectra_dict, R_interp, n_processes=8,
-        hb_center=HBETA_obs, oiii_center=OIII_5007_obs, ha_center=HALPHA_obs,
-    )
-
-Usage (full sample, straight from a catalog CSV + Campfire spectra, one
-galaxy per core):
+Usage:
     from gaussian_fitting import run_photspec_batch, load_instrument_lsf
     import pandas as pd
 
@@ -69,7 +48,7 @@ SNR_THRESHOLD_SII = 2.5
  
 # A doublet is "resolvable" if the line separation exceeds this multiple of
 # the instrumental sigma at that wavelength.
-RESOLVABILITY_FACTOR = 1.0   # set to ~0.5–1.5 depending on how strict you want to be
+RESOLVABILITY_FACTOR = 1.0
 
 
 def load_instrument_lsf(disp_file: str) -> interp1d:
@@ -98,8 +77,8 @@ def inst_sigma(lam, R_interp):
 
 def line_window(center, R_interp, n_sigma=8, min_window=0.003, max_window=0.05):
     """
-    Adaptive fitting half-width for a single line: n_sigma instrumental
-    sigmas at that wavelength, floored at min_window and capped at max_window 
+    Fitting half-width for a single line: n_sigma instrumental sigmas at that wavelength, 
+    floored at min_window and capped at max_window 
     """
     return np.clip(n_sigma * inst_sigma(center, R_interp), min_window, max_window)
 
@@ -125,7 +104,6 @@ def full_line_model(x, A_hb, A_oiii, A_ha, mu_ha, R_nii, R_sii,
  
     All line centres are tied to mu_ha via rest-frame wavelength ratios.
     sigma_int is the *intrinsic* velocity dispersion.
-    Observed σ = sqrt(sigma_int^2 + sigma_inst^2).
     """
 
     if R_interp is None:
@@ -169,7 +147,7 @@ def full_line_model(x, A_hb, A_oiii, A_ha, mu_ha, R_nii, R_sii,
 def make_model_wrapper(R_interp, fit_nii, fit_sii):
     """
     Return a curve_fit-compatible wrapper around full_line_model
-    with R_interp, fit_nii, fit_sii fixed via closure.
+    with R_interp, fit_nii, fit_sii.
     """
     def wrapper(x, A_hb, A_oiii, A_ha, mu_ha, R_nii, R_sii,
                 sigma_int, m, b):
@@ -298,8 +276,6 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
         Whether NII / SII are free components.  If False the corresponding
         ratio parameters are pinned near zero via bounds.
     window_n_sigma, window_max : float
-        Passed straight through to line_window() for the adaptive
-        per-line fitting mask (see line_window docstring).
  
     Returns:
     popt, delta_mu, m_bound, b_range, sigma_int_hi
@@ -401,8 +377,7 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
     def cont_at(lam):
         return guess_m * lam + guess_b
 
-    # Floor for degenerate amplitude guesses, scaled to the actual noise level
-    # of this spectrum rather than a fixed absolute number.
+    # Floor for degenerate amplitude guesses, scaled to the noise level of spectrum
     _err_med = np.nanmedian(err_window)
     amp_floor = 1e-3 * _err_med if (np.isfinite(_err_med) and _err_med > 0) else 1e-6
 
@@ -436,7 +411,7 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
     R_nii_lo, R_nii_hi = (0.0, 3.0) if fit_nii else (0.0, 1e-6)
     R_sii_lo, R_sii_hi = (0.0, 2.0) if fit_sii else (0.0, 1e-6)
  
-    # Zero out guesses for unfitted components so curve_fit doesn't wander
+    # Zero out guesses for unfitted components
     if not fit_nii:
         guess_R_nii = 0.0
     if not fit_sii:
@@ -468,8 +443,7 @@ def initial_fits(wave, spectrum, err_spec, window, hb_center, oiii_center, ha_ce
         m_bound, b_range,
     ]
  
-    # Clamp p0 inside bounds with a small buffer, scaled to each parameter's
-    # own bound span rather than a fixed absolute epsilon. 
+    # Clamp p0 inside bounds with a small buffer, scaled to each parameter's own bound span 
     low_arr = np.array(low_bounds, dtype=float)
     high_arr = np.array(high_bounds, dtype=float)
     span = high_arr - low_arr
@@ -553,12 +527,9 @@ def line_fitting(wave, flux, flux_err, R_interp, hb_center=0.4867, oiii_center=0
     hb_center, oiii_center, ha_center : float
         Observed-frame line centres in µm.
     window : float
-        Half-width (µm) used for the continuum mask and amplitude-guess
-        fallback. Does NOT set the per-line fitting mask (see
-        window_n_sigma / window_max below).
+        Half-width (µm) used for the continuum mask and amplitude-guess fallback.
     window_n_sigma, window_max : float
-        Control the adaptive per-line fitting window (line_window()):
-        n_sigma instrumental sigmas, capped at window_max. 
+        Control the adaptive per-line fitting window 
     snr_thresh_nii, snr_thresh_sii : float
         Minimum peak S/N required to include NII / SII as free components.
     nwalkers, steps, burnin : int
@@ -809,42 +780,6 @@ def _fit_one_spectrum(item, R_interp, line_fit_kwargs):
         return ID, None, f"{e}\n{traceback.format_exc()}"
 
 
-def run_line_fitting_batch(spectra_dict, R_interp, n_processes=8, **line_fit_kwargs):
-    """
-    Run line_fitting() over a full sample of already-loaded spectra,
-    fitting up to n_processes galaxies concurrently -- one per core.
- 
-    Parameters
-    ----------
-    spectra_dict : dict
-        {ID: (wave, flux, flux_err)} for every galaxy to fit.
-    R_interp : callable
-        Spectral resolution interpolator from load_instrument_lsf().
-    n_processes : int
-        Number of worker processes.
-    **line_fit_kwargs :
-        Passed straight through to line_fitting() (e.g. hb_center,
-        oiii_center, ha_center, window, steps, burnin, nwalkers, diagnose).
- 
-    Returns
-    -------
-    results : dict
-        {ID: (wave, flux, flux_err, df, fit_flags)} on success,
-        {ID: None} for any galaxy that raised an exception.
-    """
-    results = {}
-    worker = partial(_fit_one_spectrum, R_interp=R_interp, line_fit_kwargs=line_fit_kwargs)
-    with Pool(processes=n_processes) as pool:
-        for ID, out, err in pool.imap_unordered(worker, spectra_dict.items()):
-            if err is None:
-                print(f"--- Fitting {ID}: done ---")
-                results[ID] = out
-            else:
-                print(f"--- Fitting {ID}: FAILED ---\n  → {err}")
-                results[ID] = None
-    return results
-
-
 _WORKER_CAMPFIRE = None
 _WORKER_CAMPFIRE_DATA_DIR = None
 
@@ -874,11 +809,8 @@ def _get_worker_campfire():
 def _process_photspec_row(idx_row, R_interp, window, window_n_sigma, window_max,
                             plot_dir, line_fit_kwargs, grating='PRISM'):
     """
-    Worker for run_photspec_batch: pulls one galaxy's spectrum via Campfire
-    (obj.spectra -> .open()), runs the full fitting + summary +
-    diagnostic-plot pipeline, and returns a plain dict of results (nothing
-    containing open file handles / plots, so it pickles cleanly back to
-    the parent process).
+    Worker for run_photspec_batch: pulls one galaxy's spectrum via Campfire, runs the 
+    full fitting + summary + diagnostic-plot pipeline, and returns a plain dict of results.
     """
     idx, row = idx_row
     object_id = row["object_id"]
@@ -905,8 +837,7 @@ def _process_photspec_row(idx_row, R_interp, window, window_n_sigma, window_max,
             result['message'] = f"No {grating} spectrum found for {object_id}."
             return result
         if len(candidates) > 1:
-            # More than one PRISM spectrum (e.g. multiple programs/visits) --
-            # take the highest S/N one.
+            # More than one PRISM spectrum: take the highest S/N one.
             spec_row = candidates[np.argmax(candidates.signal_to_noise)]
         else:
             spec_row = candidates[0]
@@ -917,7 +848,7 @@ def _process_photspec_row(idx_row, R_interp, window, window_n_sigma, window_max,
         return result
 
     wave_obs = spec.wavelength
-    flux_raw = spec.flam        # erg/s/cm^2/A -- matches this module's flux-unit assumptions
+    flux_raw = spec.flam        # erg/s/cm^2/A
     err_raw = spec.flam_err
     good = spec.valid            # canonical finite-flux & positive-error mask
 
@@ -1007,7 +938,7 @@ def _process_photspec_row(idx_row, R_interp, window, window_n_sigma, window_max,
         data['Balmer_dec_err'] = (np.percentile(bd_clean, 84) - np.percentile(bd_clean, 16)) / 2
 
         # E(B-V) using Calzetti+2000 attenuation law:
-        #   E(B-V) = 1.97 * log10((Ha/Hb) / 2.86)   [2.86 = Case B Balmer decrement]
+        #   E(B-V) = 1.97 * log10((Ha/Hb) / 2.86) 
         with np.errstate(invalid='ignore', divide='ignore'):
             ebv = 1.97 * np.log10(bd / 2.86)
         ebv_clean = ebv.dropna()
@@ -1098,11 +1029,9 @@ def run_photspec_batch(catalog_df, R_interp, output_csv, plot_dir=None,
         Passed through to the per-row fit (see line_fitting/line_window).
     grating : str
         Which grating's spectrum to fit for each object (default 'PRISM').
-        If an object has more than one spectrum in this grating (e.g.
-        multiple programs/visits), the highest-S/N one is used.
+        If an object has more than one spectrum in this grating, the highest-S/N one is used.
     campfire_data_dir : str or None
-        Explicit Campfire data directory (contains meta/ and products/),
-        passed to Campfire(data_dir=...) in every worker process.
+        Explicit Campfire data directory in every worker process.
     **line_fit_kwargs :
         Any other kwargs to pass through to line_fitting (e.g. steps,
         burnin, nwalkers, snr_thresh_nii, snr_thresh_sii).
